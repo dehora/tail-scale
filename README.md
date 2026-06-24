@@ -7,8 +7,8 @@ This isn't a new idea. Marc Brooker laid out the model it runs on in 2021, and
 Dean and Barroso had named the effect eight years before that, in their classic
 tail-at-scale paper. Both arrive at the same uncomfortable place: a system can
 sit comfortably inside its percentiles while a real share of its users have a
-slow time in aggregate. This project builds on their work and lets you watch it
-happen.
+slow experience in aggregate. This project builds on their work and lets you
+watch it happen.
 
 When we reason about latency, we often do so with an average in our heads, or that only one in a hundred calls are slow, and those can hide what's happening in the tail. What catches us out isn't arithmetic as much as tail latency is **distributional**. When mobile home screen or web page fires multiple calls to render itself, the share of slow load experienced by users climbs far faster than a single endpoint's dashboard might ever suggest.
 
