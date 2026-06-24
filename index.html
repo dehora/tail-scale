@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tail at Scale—a latency intuition toy</title>
+<style>
+  :root{
+    --bg:#0f1419; --panel:#171d26; --ink:#e6edf3; --muted:#8b98a8;
+    --fast:#4c72b0; --slow:#dd8452; --bad:#e5484d; --line:#2b3543;
+    --accent:#58a6ff;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:980px;margin:0 auto;padding:16px 18px 24px}
+  h1{font-size:20px;margin:0 0 2px}
+  .sub{color:var(--muted);margin:0 0 12px;font-size:14px}
+  .story{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:12px 16px;margin-bottom:12px;font-size:14.5px;
+    min-height:70px;display:flex;align-items:center}
+  #storyText{width:100%}
+  .story b{color:var(--accent)}
+  .presets{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+  .presets button{background:var(--panel);color:var(--ink);border:1px solid var(--line);
+    border-radius:999px;padding:7px 14px;font-size:13px;cursor:pointer;transition:.15s}
+  .presets button:hover{border-color:var(--accent)}
+  .presets button.active{background:var(--accent);color:#06121f;border-color:var(--accent);
+    font-weight:600}
+  .grid{display:grid;grid-template-columns:1fr;gap:16px;align-items:start}
+  @media(min-width:760px){.grid{grid-template-columns:1.55fr 1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+  .card h3{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;
+    color:var(--muted);font-weight:600}
+  canvas{width:100%;display:block}
+  .readout{display:flex;align-items:baseline;gap:12px;margin:4px 2px 0}
+  .big{font-size:40px;font-weight:700;line-height:1}
+  .big.warn{color:var(--bad)} .big.ok{color:var(--fast)}
+  .oneIn{color:var(--muted);font-size:15px}
+  .modeRow{display:flex;gap:8px;margin-bottom:14px}
+  .modeRow button{flex:1;background:#10161f;color:var(--ink);border:1px solid var(--line);
+    border-radius:8px;padding:9px;cursor:pointer;font-size:14px}
+  .modeRow button.active{border-color:var(--accent);background:#13202f;font-weight:600}
+  .ctrl{margin:10px 0}
+  .ctrl label{display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px}
+  .ctrl label span{color:var(--muted)} .ctrl label b{color:var(--ink);font-variant-numeric:tabular-nums}
+  input[type=range]{width:100%;accent-color:var(--accent)}
+  .legend{display:flex;gap:16px;font-size:12px;color:var(--muted);margin-top:8px;flex-wrap:wrap}
+  .sw{display:inline-block;width:11px;height:11px;border-radius:2px;vertical-align:-1px;margin-right:5px}
+  .foot{color:var(--muted);font-size:12px;margin-top:16px;line-height:1.55}
+  .foot code{background:#10161f;padding:1px 5px;border-radius:4px}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Tail at Scale</h1>
+  <p class="sub">Why "our p99 is fine" and "1 in 6 users has a bad time" are the same sentence.</p>
+
+  <div class="story" id="story"><div id="storyText"></div></div>
+
+  <div class="presets" id="presets"></div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Distribution of page-load latency (<span id="trialsLbl"></span> simulated loads)</h3>
+      <canvas id="hist" data-h="330"></canvas>
+      <div class="legend">
+        <span><span class="sw" style="background:var(--fast)"></span>parallel = wait for slowest (max)</span>
+        <span><span class="sw" style="background:var(--slow)"></span>serial = sum of the chain</span>
+        <span><span class="sw" style="background:var(--bad)"></span>budget—past this is "bad"</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Controls</h3>
+      <div class="modeRow">
+        <button data-mode="parallel" class="active">Parallel ▸ fan-out</button>
+        <button data-mode="serial">Serial ▸ chain</button>
+      </div>
+
+      <div class="ctrl">
+        <label>Dependencies <span>N calls</span><b id="nVal"></b></label>
+        <input type="range" id="n" min="1" max="50" step="1" value="1">
+      </div>
+      <div class="ctrl">
+        <label>Per-call reliability <span id="pLbl"></span><b id="wVal"></b></label>
+        <input type="range" id="w" min="0.1" max="10" step="0.1" value="1">
+      </div>
+      <div class="ctrl">
+        <label>Tail-mode latency <span>slow-call mean</span><b id="slowVal"></b></label>
+        <input type="range" id="slow" min="200" max="2000" step="20" value="800">
+      </div>
+      <div class="ctrl">
+        <label>Latency budget <span>"bad" threshold</span><b id="budgetVal"></b></label>
+        <input type="range" id="budget" min="100" max="2000" step="10" value="250">
+      </div>
+
+      <div class="readout">
+        <div class="big" id="pbad"></div>
+        <div class="oneIn" id="oneIn"></div>
+      </div>
+
+      <h3 style="margin-top:18px">P(bad) as you add dependencies</h3>
+      <canvas id="curve" data-h="120"></canvas>
+      <p style="font-size:11px;color:var(--muted);margin:8px 2px 0;line-height:1.45">
+        In the sandbox, if the tail mode drops below the budget no call counts as slow—the
+        p99→bad mapping only holds while the budget sits between the two modes.</p>
+    </div>
+  </div>
+
+  <p class="foot">
+    Model: each call's latency is a mix of a fast mode <code>N(80, 8)</code> ms and a
+    heavy tail mode <code>N(slow, slow/10)</code> ms, with the tail hit at rate <code>w = 1 − reliability</code>.
+    <b>Parallel</b> waits for the slowest call (max): the tail mode takes over as N grows.
+    <b>Serial</b> sums the chain: the whole distribution marches right by the <i>mean</i>, and the
+    average alone blows the budget. Independence is the optimistic case, not the safe
+    one—correlated stalls (a shared backend, a GC pause) only move it the wrong way. The numbers are
+    validated against <code>model.py</code> (<code>P(bad)=1−(1−w)<sup>N</sup></code> for parallel).
+    All in-browser, no network. This bimodal experiment follows Marc Brooker's
+    <a href="https://brooker.co.za/blog/2021/04/19/latency.html">Tail Latency Might Matter More Than You Think</a> (2021);
+    the effect was named by Dean &amp; Barroso,
+    <a href="https://www.barroso.org/publications/TheTailAtScale.pdf">The Tail at Scale</a> (2013).
+  </p>
+</div>
+
+<script>
+"use strict";
+// ---------- the model (kept in lockstep with model.py) ----------
+const FAST_MEAN=80, FAST_SD=8;
+let state={mode:"parallel", n:1, w:0.01, slowMean:800, budget:250};
+const TRIALS=30000;          // for the histogram
+const CURVE_TRIALS=4000;     // lighter, for the serial sweep
+
+let _spare=null;             // Box-Muller cache
+function gauss(mean,sd){
+  if(_spare!==null){const v=_spare;_spare=null;return mean+sd*v;}
+  let u=0,v=0,s=0;
+  do{u=Math.random()*2-1;v=Math.random()*2-1;s=u*u+v*v;}while(s>=1||s===0);
+  const f=Math.sqrt(-2*Math.log(s)/s);
+  _spare=v*f;
+  return mean+sd*(u*f);
+}
+function drawCall(w,slowMean){
+  return Math.random()<w ? gauss(slowMean,slowMean*0.1) : gauss(FAST_MEAN,FAST_SD);
+}
+// returns Float32Array of aggregate latency per trial
+function simulate(n,mode,w,slowMean,trials){
+  const out=new Float32Array(trials);
+  for(let t=0;t<trials;t++){
+    let agg = 0;
+    if(mode==="parallel"){
+      let mx=0;
+      for(let i=0;i<n;i++){const c=drawCall(w,slowMean); if(c>mx)mx=c;}
+      agg=mx;
+    }else{
+      let s=0;
+      for(let i=0;i<n;i++) s+=drawCall(w,slowMean);
+      agg=s;
+    }
+    out[t]=agg;
+  }
+  return out;
+}
+function fracBad(arr,budget){let b=0;for(let i=0;i<arr.length;i++)if(arr[i]>budget)b++;return b/arr.length;}
+
+// ---------- canvas helpers ----------
+function fitCanvas(cv){
+  const dpr=window.devicePixelRatio||1;
+  const h=parseInt(cv.dataset.h,10);   // logical height—stored, never read back from cv.height
+  const w=cv.clientWidth;
+  cv.style.height=h+"px";
+  cv.width=w*dpr; cv.height=h*dpr;
+  const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+  return {ctx,w,h};
+}
+const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+function drawHist(arr,budget,mode){
+  const cv=document.getElementById("hist");
+  const {ctx,w,h}=fitCanvas(cv);
+  ctx.clearRect(0,0,w,h);
+  const padL=8,padR=8,padB=24,padT=8;
+  // x range: cover budget and the 99.7th pct of data
+  const sorted=Float32Array.from(arr).sort();
+  const hi=Math.max(sorted[Math.floor(arr.length*0.997)], budget*1.15);
+  const xmax=Math.ceil(hi/100)*100;
+  const BINS=90;
+  const bins=new Float32Array(BINS);
+  for(let i=0;i<arr.length;i++){let b=Math.floor(arr[i]/xmax*BINS); if(b>=BINS)b=BINS-1; if(b<0)b=0; bins[b]++;}
+  let bmax=0; for(const v of bins) if(v>bmax)bmax=v;
+  const plotW=w-padL-padR, plotH=h-padB-padT;
+  const x=v=>padL+v/xmax*plotW;
+  const col=mode==="parallel"?css("--fast"):css("--slow");
+  const bw=plotW/BINS;
+  for(let i=0;i<BINS;i++){
+    const binLo=i/BINS*xmax;
+    const bh=bins[i]/bmax*plotH;
+    ctx.fillStyle = binLo>=budget ? css("--bad") : col;
+    ctx.globalAlpha = binLo>=budget ? 0.55 : 0.9;
+    ctx.fillRect(padL+i*bw, padT+plotH-bh, Math.max(bw-0.5,0.5), bh);
+  }
+  ctx.globalAlpha=1;
+  // budget line
+  const bx=x(budget);
+  ctx.strokeStyle=css("--bad"); ctx.lineWidth=2; ctx.setLineDash([5,4]);
+  ctx.beginPath(); ctx.moveTo(bx,padT); ctx.lineTo(bx,padT+plotH); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle=css("--bad"); ctx.font="11px sans-serif"; ctx.textAlign="left";
+  ctx.fillText("budget "+Math.round(budget)+"ms", Math.min(bx+5,w-90), padT+12);
+  // x ticks
+  ctx.fillStyle=css("--muted"); ctx.font="11px sans-serif"; ctx.textAlign="center";
+  const step=xmax/5;
+  for(let t=0;t<=5;t++){const xv=t*step; ctx.fillText(Math.round(xv)+(t===5?" ms":""), x(xv), h-7);}
+}
+
+let curveCache={key:"",ys:null};
+function drawCurve(){
+  const cv=document.getElementById("curve");
+  const {ctx,w,h}=fitCanvas(cv);
+  ctx.clearRect(0,0,w,h);
+  const padL=30,padR=10,padB=20,padT=8;
+  const plotW=w-padL-padR, plotH=h-padB-padT;
+  const NMAX=50;
+  // Simulate both modes so the curve always matches the histogram readout,
+  // including in the sandbox where the budget can leave the analytic regime.
+  // Cache it keyed on its real inputs; dragging N moves the marker only, so it
+  // shouldn't re-simulate the whole sweep each frame.
+  const key=state.mode+"|"+state.w+"|"+state.slowMean+"|"+state.budget;
+  let ys=curveCache.key===key ? curveCache.ys : null;
+  if(!ys){
+    ys=[];
+    for(let n=1;n<=NMAX;n++) ys.push(fracBad(simulate(n,state.mode,state.w,state.slowMean,CURVE_TRIALS),state.budget)*100);
+    curveCache={key,ys};
+  }
+  const ymax=Math.max(10,Math.ceil(Math.max(...ys)/10)*10);
+  const X=n=>padL+(n-1)/(NMAX-1)*plotW;
+  const Y=p=>padT+plotH-p/ymax*plotH;
+  // axes
+  ctx.strokeStyle=css("--line"); ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(padL,padT);ctx.lineTo(padL,padT+plotH);ctx.lineTo(padL+plotW,padT+plotH);ctx.stroke();
+  ctx.fillStyle=css("--muted");ctx.font="10px sans-serif";ctx.textAlign="right";
+  for(let t=0;t<=ymax;t+=ymax/2){ctx.fillText(t+"%",padL-4,Y(t)+3);}
+  ctx.textAlign="center";
+  for(const n of [1,10,20,30,40,50]) ctx.fillText(n,X(n),h-6);
+  // line
+  ctx.strokeStyle=css("--accent");ctx.lineWidth=2;ctx.beginPath();
+  ys.forEach((p,i)=>{const xx=X(i+1),yy=Y(p); i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy);});
+  ctx.stroke();
+  // current N marker
+  const cy=Y(ys[state.n-1]);
+  ctx.fillStyle=css("--ink");ctx.beginPath();ctx.arc(X(state.n),cy,4,0,7);ctx.fill();
+}
+
+// ---------- render ----------
+let raf=null;
+function render(){
+  document.getElementById("trialsLbl").textContent=TRIALS.toLocaleString();
+  const arr=simulate(state.n,state.mode,state.w,state.slowMean,TRIALS);
+  const pbad=fracBad(arr,state.budget);
+  drawHist(arr,state.budget,state.mode);
+  drawCurve();
+  const pEl=document.getElementById("pbad");
+  pEl.textContent=(pbad*100).toFixed(pbad<0.1?1:0)+"%";
+  pEl.className="big "+(pbad>=0.05?"warn":"ok");
+  document.getElementById("oneIn").textContent=
+    pbad<=0   ? "of loads are bad" :
+    pbad<0.5  ? "of loads are bad ≈ 1 in "+Math.round(1/pbad) :   // rare: 1 in N reads best
+                "of loads are bad ≈ "+Math.round(pbad*10)+" in 10"; // common: N in 10 reads best
+}
+function schedule(){ if(raf)cancelAnimationFrame(raf); raf=requestAnimationFrame(render); }
+
+// ---------- controls ----------
+function syncLabels(){
+  document.getElementById("nVal").textContent=state.n;
+  document.getElementById("wVal").textContent=(state.w*100).toFixed(1)+"% slow";
+  document.getElementById("pLbl").textContent="p"+(100-state.w*100).toFixed(state.w*100<1?1:0);
+  document.getElementById("slowVal").textContent=state.slowMean+" ms";
+  document.getElementById("budgetVal").textContent=state.budget+" ms";
+}
+function bindRange(id,key,scale=1){
+  const el=document.getElementById(id);
+  el.addEventListener("input",()=>{state[key]=parseFloat(el.value)*scale; syncLabels(); schedule();});
+}
+bindRange("n","n");
+bindRange("w","w",0.01);
+bindRange("slow","slowMean");
+bindRange("budget","budget");
+document.querySelectorAll(".modeRow button").forEach(b=>{
+  b.addEventListener("click",()=>{
+    state.mode=b.dataset.mode;
+    document.querySelectorAll(".modeRow button").forEach(x=>x.classList.toggle("active",x===b));
+    schedule();
+  });
+});
+
+function applyState(s){
+  Object.assign(state,s);
+  document.getElementById("n").value=state.n;
+  document.getElementById("w").value=(state.w*100).toFixed(1);
+  document.getElementById("slow").value=state.slowMean;
+  document.getElementById("budget").value=state.budget;
+  document.querySelectorAll(".modeRow button").forEach(x=>x.classList.toggle("active",x.dataset.mode===state.mode));
+  syncLabels(); schedule();
+}
+
+// ---------- guided story ----------
+const PRESETS=[
+  {name:"① One call",
+   story:"One call to a <b>p99</b> backend. One load in a hundred crosses the budget. At that rate nobody files a ticket, and nobody should.",
+   s:{mode:"parallel",n:1,w:0.01,slowMean:800,budget:250}},
+  {name:"② 18-call fan-out",
+   story:"Fan the home screen out to <b>18</b> calls and wait for the slowest. Same p99 backend as before, and now <b>one load in six</b> is slow. The only thing that grew was the number of calls.",
+   s:{mode:"parallel",n:18,w:0.01,slowMean:800,budget:250}},
+  {name:"③ Push it to 40",
+   story:"Keep adding dependencies. By <b>forty calls</b> the tail you called rare is <b>one load in three</b>. The edge case is the common case now.",
+   s:{mode:"parallel",n:40,w:0.01,slowMean:800,budget:250}},
+  {name:"④ Make them serial",
+   story:"Chain the calls instead of fanning out, and the failure changes shape: the whole distribution <b>marches right</b>. The <i>mean</i> alone blows the budget—no slow call required.",
+   s:{mode:"serial",n:15,w:0.01,slowMean:800,budget:250}},
+  {name:"⑤ Realistic mobile",
+   story:"A normal phone, not a bad one: <b>p95</b> per call, eight calls behind the home screen. <b>One load in three</b> is slow, and every endpoint's dashboard is still green.",
+   s:{mode:"parallel",n:8,w:0.05,slowMean:800,budget:250}},
+  {name:"⑥ Sandbox",
+   story:"Every value is a knob now. Drop reliability toward <b>p90</b>, add a few calls, make the tail heavier. Put your own system's numbers in and read the bad rate off.",
+   s:{mode:"parallel",n:8,w:0.01,slowMean:800,budget:250}},
+];
+const pc=document.getElementById("presets");
+PRESETS.forEach((p,i)=>{
+  const b=document.createElement("button");
+  b.textContent=p.name;
+  b.addEventListener("click",()=>{
+    document.querySelectorAll("#presets button").forEach(x=>x.classList.remove("active"));
+    b.classList.add("active");
+    document.getElementById("storyText").innerHTML=p.story;
+    applyState(p.s);
+  });
+  pc.appendChild(b);
+});
+
+// boot on preset ②, the punchline
+window.addEventListener("resize",schedule);
+document.querySelectorAll("#presets button")[1].click();
+</script>
+</body>
+</html>
