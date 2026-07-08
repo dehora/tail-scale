@@ -35,7 +35,8 @@
   canvas{width:100%;display:block}
   .readout{display:flex;align-items:baseline;gap:12px;margin:4px 2px 0}
   .big{font-size:34px;font-weight:700;line-height:1}
-  .big.warn{color:var(--bad)} .big.ok{color:var(--fast)}
+  /* number = severity ramp (green ok / neutral notable / red clearly-bad); the live per-sample verdict lives on the dots+pill */
+  .big.ok{color:var(--ok)} .big.warn{color:var(--ink)} .big.bad{color:var(--bad)}
   .oneIn{color:var(--muted);font-size:15px}
   .modeRow{display:flex;gap:8px;margin-bottom:10px}
   .modeRow button{flex:1;background:#10161f;color:var(--ink);border:1px solid var(--line);
@@ -59,7 +60,7 @@
   .heroTop .q{font-size:15px} .heroTop .q b{color:var(--ink)}
   .heroNum{display:flex;align-items:baseline;gap:10px;margin-left:auto}
   .heroNum .big{font-size:34px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}
-  .heroNum .big.warn{color:var(--bad)} .heroNum .big.ok{color:var(--ok)}
+  .heroNum .big.ok{color:var(--ok)} .heroNum .big.warn{color:var(--ink)} .heroNum .big.bad{color:var(--bad)}
   .heroNum .cap{color:var(--muted);font-size:12.5px;max-width:170px}
   .dots{display:flex;flex-wrap:wrap;gap:4px;margin:5px 0 8px;min-height:15px}
   .dot{width:11px;height:11px;border-radius:50%;background:var(--ok);transition:background .18s,box-shadow .18s}
@@ -97,7 +98,7 @@
         <b id="nLabel">1</b> of them.</div>
       <div class="heroNum">
         <div class="big warn" id="pAny">—</div>
-        <div class="cap">of results hit at least one backend in its tail</div>
+        <div class="cap">of client results are slow</div>
       </div>
     </div>
     <div class="dots" id="dots"></div>
@@ -106,8 +107,8 @@
         <span class="pill green" id="reqPill">result: <span class="st" id="reqSt">fast</span></span>
         <span class="live" id="live"></span>
       </div>
-      <span class="expl">every dot green means every backend is inside its SLO — the
-        <b>result</b> is slow whenever <b>any one</b> is in its tail</span>
+      <span class="expl" id="expl">every dot green means that backend delivered in time — the
+        <b>result</b> is slow whenever <b>any dot</b> is red</span>
     </div>
   </div>
 
@@ -193,6 +194,9 @@ let state={mode:"parallel", n:1, w:0.01, slowMean:800, budget:250, rho:0, hedge:
 const TRIALS=30000;          // for the histogram
 const CURVE_TRIALS=4000;     // lighter, for the serial sweep
 
+// deterministic PRNG (mulberry32): a given set of controls always yields the same
+// numbers, so the headline colour can't flicker from MC noise sitting on a threshold.
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
 let _spare=null;             // Box-Muller cache
 function gauss(mean,sd){
   if(_spare!==null){const v=_spare;_spare=null;return mean+sd*v;}
@@ -215,6 +219,9 @@ function drawHedged(w,slowMean,hedge){
 }
 // returns Float32Array of aggregate latency per trial
 function simulate(n,mode,w,slowMean,rho,hedge,trials){
+  const _rand=Math.random, _sp=_spare;           // seed the whole sim, then restore the live RNG
+  Math.random=mulberry32(0x9E3779B9); _spare=null;
+  try{
   const out=new Float32Array(trials);
   for(let t=0;t<trials;t++){
     let agg = 0;
@@ -234,6 +241,7 @@ function simulate(n,mode,w,slowMean,rho,hedge,trials){
     out[t]=agg;
   }
   return out;
+  } finally { Math.random=_rand; _spare=_sp; }   // dots and other live bits stay truly random
 }
 function fracBad(arr,budget){let b=0;for(let i=0;i<arr.length;i++)if(arr[i]>budget)b++;return b/arr.length;}
 
@@ -335,7 +343,9 @@ function render(){
   drawCurve();
   const pEl=document.getElementById("pbad");
   pEl.textContent=(pbad*100).toFixed(pbad<0.1?1:0)+"%";
-  pEl.className="big "+(pbad>=0.05?"warn":"ok");
+  pEl.className="big "+(pbad>=0.12?"bad":pbad>=0.05?"warn":"ok");  // green<5% / neutral 5-12% / red≥12% (headline 17% reads red)
+  const hEl=document.getElementById("pAny");           // hero headline = same sim as the panel, never a different number
+  hEl.textContent=pEl.textContent; hEl.className=pEl.className;
   document.getElementById("oneIn").textContent=
     pbad<=0   ? "of results are bad" :
     pbad<0.5  ? "of results are bad ≈ 1 in "+Math.round(1/pbad) :   // rare: 1 in N reads best
@@ -370,11 +380,11 @@ document.querySelectorAll(".modeRow button").forEach(b=>{
   b.addEventListener("click",()=>{
     state.mode=b.dataset.mode;
     document.querySelectorAll(".modeRow button").forEach(x=>x.classList.toggle("active",x===b));
-    schedule();
+    heroStatic(); schedule();
   });
 });
 document.getElementById("hedge").addEventListener("click",()=>{
-  state.hedge=!state.hedge; syncLabels(); schedule();
+  state.hedge=!state.hedge; syncLabels(); heroStatic(); schedule();
 });
 
 function applyState(s){
@@ -393,7 +403,7 @@ function applyState(s){
 // ---------- hero: all green, still slow (fan-out arithmetic, live) ----------
 const dotsEl=document.getElementById("dots");
 let dotNodes=[], obsSlow=0, obsTot=0;
-const pAnyHero=()=>1-Math.pow(1-state.w,state.n);
+const pBaseHero=()=>1-Math.pow(1-state.w,state.n);          // naked fan-out, 1-(1-w)^N, the fixed baseline reference
 function heroBuild(){
   dotsEl.innerHTML=""; dotNodes=[];
   for(let i=0;i<state.n;i++){const d=document.createElement("span");d.className="dot";dotsEl.appendChild(d);dotNodes.push(d);}
@@ -401,21 +411,31 @@ function heroBuild(){
 function heroStatic(){
   document.getElementById("nLabel").textContent=state.n;
   document.getElementById("pLabel").textContent="p"+(100-state.w*100).toFixed(state.w*100<1?1:0);
-  const v=pAnyHero(), pe=document.getElementById("pAny");
-  pe.textContent=(v*100).toFixed(v<0.1?1:0)+"%";
-  pe.className="big "+(v>=0.1?"warn":"ok");
-  obsSlow=0; obsTot=0;
+  document.getElementById("expl").innerHTML = state.mode==="serial"
+    ? "every dot green means that call came back in time — but a chain <b>adds them up</b>, so the result is slow once the sum passes the budget, red dots or not"
+    : "every dot green means that backend delivered in time — the <b>result</b> is slow whenever <b>any dot</b> is red";
+  obsSlow=0; obsTot=0;   // hero headline number is set in render(), from the panel's own simulation
 }
 function heroTick(){
   if(!dotNodes.length) return;
-  let anySlow=false;
-  for(const d of dotNodes){const slow=Math.random()<state.w; if(slow)anySlow=true; d.classList.toggle("slow",slow);}
-  obsTot++; if(anySlow)obsSlow++;
+  // one live sampled result, drawn the same way the panel does it: a dot reddens when
+  // that one call is over budget; the verdict aggregates by mode (max vs sum).
+  const shared=state.mode==="parallel"&&state.rho>0&&Math.random()<state.rho; // a shared stall hits every call at once
+  let mx=0,sum=0;
+  for(const d of dotNodes){
+    const c=shared?gauss(state.slowMean,state.slowMean*0.1):drawHedged(state.w,state.slowMean,state.hedge);
+    if(c>mx)mx=c; sum+=c;
+    d.classList.toggle("slow",c>state.budget);
+  }
+  const slow=(state.mode==="serial"?sum:mx)>state.budget;    // parallel waits on the slowest; serial adds the chain up
+  obsTot++; if(slow)obsSlow++;
   const pill=document.getElementById("reqPill");
-  pill.className="pill "+(anySlow?"red":"green");
-  document.getElementById("reqSt").textContent=anySlow?"slow":"fast";
-  document.getElementById("live").innerHTML="observed <b>"+(100*obsSlow/obsTot).toFixed(0)+
-    "%</b> · predicted <span class='f'>1−(1−w)ᴺ</span> = <b>"+(100*pAnyHero()).toFixed(0)+"%</b>";
+  pill.className="pill "+(slow?"red":"green");
+  document.getElementById("reqSt").textContent=slow?"slow":"fast";
+  const ref=state.mode==="serial"
+    ? "sum ≈ <b>"+Math.round(state.n*FAST_MEAN)+"ms</b> vs "+state.budget+"ms budget"
+    : "baseline <span class='f'>1−(1−w)ᴺ</span> = <b>"+(100*pBaseHero()).toFixed(0)+"%</b>";
+  document.getElementById("live").innerHTML="observed <b>"+(100*obsSlow/obsTot).toFixed(0)+"%</b> · "+ref;
 }
 
 // ---------- guided story ----------
