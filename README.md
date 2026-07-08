@@ -23,7 +23,7 @@ If you prefer code, the numbers the web page is built on are taken from the code
 uv run model.py
 ```
 
-This prints an N-vs-P(bad) table, asserts the parallel result matches the analytic formula, and regenerates the plots below. And so `index.html` and `model.py` run the identical model, and `model.py` asserts the Monte-Carlo agrees with `1 − (1 − w)^N`.
+This prints an N-vs-P(bad) table, asserts the parallel result matches the analytic formula (and that hedging collapses the per-call miss to `w²`), and regenerates the plots below. And so `index.html` and `model.py` run the identical model, and `model.py` asserts the Monte-Carlo agrees with `1 − (1 − w)^N`.
 
 ### The controls
 
@@ -35,6 +35,7 @@ Each slider has an `i` you can hover in the page for the same note.
 - **Tail-mode latency** — how slow a slow call is: the mean of the heavy mode, `N(slow, slow/10)` ms. Keep it above the budget or nothing counts as slow.
 - **Latency budget** — your UX target; a result is bad past this line. It sits between the fast (~80 ms) and slow modes, so one tail call in the fan-out tips the result over.
 - **Correlation** — the chance a shared dependency (a common cache, lock, or GC pause) stalls the whole fan-out at once. Independence is the optimistic floor; turn this up and the tail fattens past `1 − (1 − w)^N`. Applies to parallel fan-out.
+- **Hedge slow calls** — the one fix the toy lets you try. Fire a backup to a second replica when the first is slow and take whichever returns first. A call is slow only if *both* tries are, so the per-call miss drops `w → w²` (a 1% tail becomes 0.01%). But it only holds while the two are independent—turn correlation up and `w²` collapses back toward `w`, because a shared stall hits both replicas at once.
 
 
 ## The intuition
@@ -107,9 +108,9 @@ This is just a quick model to build intuition, and there are two caveats worth m
 
 ## What helps, and when it backfires
 
-The tool shows the problem, not the fix—but the correlation slider hints at why the usual fixes are conditional. Two are worth knowing.
+The tool mostly shows the problem, but it lets you try one fix—the **hedge** toggle—and the correlation slider is there to show why even that fix is conditional. Two mitigations are worth knowing.
 
-**Request hedging** [1]. Fire a backup to a second replica once the first misses a timing target, and take whichever returns first. If the two tries fail *independently*, a `w` tail drops to `w²`—a 1% miss becomes 0.01%. But that only holds while they're independent. If both are waiting on the same contended thing, `w²` collapses back to `w`, and you've added load to the resource that was already slow. (Likely why gRPC exposes client-side deadlines.)
+**Request hedging** [1]. Fire a backup to a second replica once the first misses a timing target, and take whichever returns first. If the two tries fail *independently*, a `w` tail drops to `w²`—a 1% miss becomes 0.01%. But that only holds while they're independent. If both are waiting on the same contended thing, `w²` collapses back to `w`, and you've added load to the resource that was already slow. (Likely why gRPC exposes client-side deadlines.) Flip the hedge toggle on in the sandbox, then turn correlation up and watch `w²` climb back toward `w` in real time.
 
 **Power of two random choices** [6]. When you get to pick where a request goes, sample two candidates and send it to the less loaded one. It stops a hot spot forming rather than reacting to one—but you need two *real* choices to pick between.
 

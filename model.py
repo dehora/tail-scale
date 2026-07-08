@@ -56,8 +56,15 @@ def aggregate(calls, mode):
     raise ValueError(mode)
 
 
-def p_bad_mc(rng, n, mode, w=W, budget=BUDGET, trials=TRIALS, rho=0.0):
+def p_bad_mc(rng, n, mode, w=W, budget=BUDGET, trials=TRIALS, rho=0.0, hedge=False):
     calls = sample_calls(rng, (trials, n), w)
+    if hedge:
+        # Hedged request: fire a backup to a second replica, take the faster. A
+        # call is slow only if BOTH independent tries are slow, so the per-call
+        # miss collapses w -> w^2. The correlated shared stall below is NOT hedged
+        # away — both replicas wait on the same dependency — which is what breaks
+        # the collapse.
+        calls = np.minimum(calls, sample_calls(rng, (trials, n), w))
     agg = aggregate(calls, mode)
     if mode == "parallel" and rho > 0:
         # Correlation: with probability rho a shared dependency stalls the whole
@@ -107,6 +114,19 @@ def assert_parallel_matches_analytic(rng):
         an = p_bad_analytic_parallel(n)
         assert abs(mc - an) < tol, f"N={n}: MC {mc:.3%} vs analytic {an:.3%}"
     print(f"[ok] parallel MC matches 1-(1-w)^N within {tol:.0%} across N")
+
+
+def assert_hedge_collapses(rng):
+    """Independent hedging drops the per-call miss to w^2; correlation undoes it."""
+    # One independent hedged call is bad only if both tries land in the tail: ~w^2.
+    mc = p_bad_mc(rng, 1, "parallel", hedge=True)
+    assert abs(mc - W * W) < 0.005, f"hedged n=1: MC {mc:.4%} vs w^2 {W * W:.4%}"
+    # Turn correlation up and the shared stall dominates: the hedge can't touch it,
+    # so the bad rate is ~rho, not w^2.
+    rho = 0.15
+    mc_corr = p_bad_mc(rng, 1, "parallel", hedge=True, rho=rho)
+    assert abs(mc_corr - rho) < 0.02, f"hedged+corr n=1: MC {mc_corr:.3%} vs rho {rho:.0%}"
+    print(f"[ok] hedge: independent -> w^2 ({W * W:.2%}), correlated -> rho ({rho:.0%})")
 
 
 def plot_climb(rng, out):
@@ -164,9 +184,17 @@ def main():
     worst = print_table(rng)
     print(f"max |MC - analytic| over the table (parallel) = {worst:.3%}")
     assert_parallel_matches_analytic(rng)
+    assert_hedge_collapses(rng)
     print(f"[corr] N=18 parallel: rho=0 -> {p_bad_mc(rng, 18, 'parallel'):.1%}   "
           f"rho=15% -> {p_bad_mc(rng, 18, 'parallel', rho=0.15):.1%}   "
           f"(independence is the optimistic floor)")
+    print(f"[hedge] N=18 parallel: off -> {p_bad_mc(rng, 18, 'parallel'):.1%}   "
+          f"hedged -> {p_bad_mc(rng, 18, 'parallel', hedge=True):.2%}   "
+          f"hedged+corr(15%) -> {p_bad_mc(rng, 18, 'parallel', hedge=True, rho=0.15):.1%}   "
+          f"(the fix evaporates under correlation)")
+    # Reseed so the plots depend only on SEED, not on how many diagnostic draws
+    # ran above — keeps docs/*.png reproducible as the checks around them grow.
+    rng = np.random.default_rng(SEED)
     docs = Path(__file__).parent / "docs"
     docs.mkdir(exist_ok=True)
     plot_climb(rng, docs / "climb.png")

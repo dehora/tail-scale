@@ -45,6 +45,9 @@
   .ctrl label{display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px}
   .ctrl label span{color:var(--muted)} .ctrl label b{color:var(--ink);font-variant-numeric:tabular-nums}
   input[type=range]{width:100%;accent-color:var(--accent)}
+  .toggle{width:100%;background:#10161f;color:var(--ink);border:1px solid var(--line);
+    border-radius:8px;padding:9px;cursor:pointer;font-size:14px;text-align:left}
+  .toggle.active{border-color:var(--ok);background:#132218;color:var(--ok);font-weight:600}
   .legend{display:flex;gap:16px;font-size:12px;color:var(--muted);margin-top:8px;flex-wrap:wrap}
   .sw{display:inline-block;width:11px;height:11px;border-radius:2px;vertical-align:-1px;margin-right:5px}
   .foot{color:var(--muted);font-size:12px;margin-top:16px;line-height:1.55}
@@ -155,6 +158,10 @@
         <label><span class="nm">Correlation <i class="info" data-tip="Independence is the optimistic floor. This is the chance a shared dependency — a common cache, lock, or GC pause — stalls the whole fan-out at once. When it fires every call is slow together, so the tail fattens past <code>1−(1−w)^N</code>. Applies to parallel fan-out.">i</i></span> <span>shared-hub stalls</span><b id="rhoVal"></b></label>
         <input type="range" id="rho" min="0" max="30" step="1" value="0">
       </div>
+      <div class="ctrl">
+        <label><span class="nm">Hedge slow calls <i class="info" data-tip="The fix. Fire a backup to a second replica when the first is slow and take whichever returns first. If the two tries fail independently the per-call miss drops from <code>w</code> to <code>w²</code> — a 1% tail becomes 0.01%. But turn correlation up: when both replicas wait on the same contended dependency, <code>w²</code> collapses back to <code>w</code> and you've only added load.">i</i></span> <span id="hedgeSub">per-call miss</span><b id="hedgeVal">off</b></label>
+        <button type="button" id="hedge" class="toggle">Off — send one call</button>
+      </div>
 
       <div class="readout">
         <div class="big" id="pbad"></div>
@@ -182,7 +189,7 @@
 "use strict";
 // ---------- the model (kept in lockstep with model.py) ----------
 const FAST_MEAN=80, FAST_SD=8;
-let state={mode:"parallel", n:1, w:0.01, slowMean:800, budget:250, rho:0};
+let state={mode:"parallel", n:1, w:0.01, slowMean:800, budget:250, rho:0, hedge:false};
 const TRIALS=30000;          // for the histogram
 const CURVE_TRIALS=4000;     // lighter, for the serial sweep
 
@@ -198,22 +205,30 @@ function gauss(mean,sd){
 function drawCall(w,slowMean){
   return Math.random()<w ? gauss(slowMean,slowMean*0.1) : gauss(FAST_MEAN,FAST_SD);
 }
+// hedged call: fire a backup to a 2nd replica, take the faster. Slow only if both
+// tries are slow, so the per-call miss collapses w -> w^2.
+function drawHedged(w,slowMean,hedge){
+  const a=drawCall(w,slowMean);
+  if(!hedge) return a;
+  const b=drawCall(w,slowMean);
+  return a<b?a:b;
+}
 // returns Float32Array of aggregate latency per trial
-function simulate(n,mode,w,slowMean,rho,trials){
+function simulate(n,mode,w,slowMean,rho,hedge,trials){
   const out=new Float32Array(trials);
   for(let t=0;t<trials;t++){
     let agg = 0;
     if(mode==="parallel"){
-      if(rho>0 && Math.random()<rho){          // shared-hub stall: the whole fan-out goes slow together
+      if(rho>0 && Math.random()<rho){          // shared-hub stall: not hedged away — both replicas share the dependency
         agg=gauss(slowMean,slowMean*0.1);
       }else{
         let mx=0;
-        for(let i=0;i<n;i++){const c=drawCall(w,slowMean); if(c>mx)mx=c;}
+        for(let i=0;i<n;i++){const c=drawHedged(w,slowMean,hedge); if(c>mx)mx=c;}
         agg=mx;
       }
     }else{
       let s=0;
-      for(let i=0;i<n;i++) s+=drawCall(w,slowMean);
+      for(let i=0;i<n;i++) s+=drawHedged(w,slowMean,hedge);
       agg=s;
     }
     out[t]=agg;
@@ -284,11 +299,11 @@ function drawCurve(){
   // including in the sandbox where the budget can leave the analytic regime.
   // Cache it keyed on its real inputs; dragging N moves the marker only, so it
   // shouldn't re-simulate the whole sweep each frame.
-  const key=state.mode+"|"+state.w+"|"+state.slowMean+"|"+state.budget+"|"+state.rho;
+  const key=state.mode+"|"+state.w+"|"+state.slowMean+"|"+state.budget+"|"+state.rho+"|"+state.hedge;
   let ys=curveCache.key===key ? curveCache.ys : null;
   if(!ys){
     ys=[];
-    for(let n=1;n<=NMAX;n++) ys.push(fracBad(simulate(n,state.mode,state.w,state.slowMean,state.rho,CURVE_TRIALS),state.budget)*100);
+    for(let n=1;n<=NMAX;n++) ys.push(fracBad(simulate(n,state.mode,state.w,state.slowMean,state.rho,state.hedge,CURVE_TRIALS),state.budget)*100);
     curveCache={key,ys};
   }
   const ymax=Math.max(10,Math.ceil(Math.max(...ys)/10)*10);
@@ -314,7 +329,7 @@ function drawCurve(){
 let raf=null;
 function render(){
   document.getElementById("trialsLbl").textContent=TRIALS.toLocaleString();
-  const arr=simulate(state.n,state.mode,state.w,state.slowMean,state.rho,TRIALS);
+  const arr=simulate(state.n,state.mode,state.w,state.slowMean,state.rho,state.hedge,TRIALS);
   const pbad=fracBad(arr,state.budget);
   drawHist(arr,state.budget,state.mode);
   drawCurve();
@@ -336,6 +351,11 @@ function syncLabels(){
   document.getElementById("slowVal").textContent=state.slowMean+" ms";
   document.getElementById("budgetVal").textContent=state.budget+" ms";
   document.getElementById("rhoVal").textContent=(state.rho*100).toFixed(0)+"%";
+  const pct=v=>{const p=v*100; return (p>=1?p.toFixed(0):p>=0.1?p.toFixed(1):p>=0.01?p.toFixed(2):p.toPrecision(1))+"%";};
+  document.getElementById("hedgeVal").textContent=state.hedge ? pct(state.w)+" → "+pct(state.w*state.w) : pct(state.w);
+  const hb=document.getElementById("hedge");
+  hb.classList.toggle("active",state.hedge);
+  hb.textContent=state.hedge ? "On — hedge to a 2nd replica" : "Off — send one call";
 }
 function bindRange(id,key,scale=1){
   const el=document.getElementById(id);
@@ -353,9 +373,13 @@ document.querySelectorAll(".modeRow button").forEach(b=>{
     schedule();
   });
 });
+document.getElementById("hedge").addEventListener("click",()=>{
+  state.hedge=!state.hedge; syncLabels(); schedule();
+});
 
 function applyState(s){
   state.rho = ('rho' in s) ? s.rho : 0;
+  state.hedge = ('hedge' in s) ? s.hedge : false;
   Object.assign(state,s);
   document.getElementById("n").value=state.n;
   document.getElementById("w").value=(state.w*100).toFixed(1);
@@ -414,9 +438,12 @@ const PRESETS=[
   {name:"⑥ Correlated stalls",
    story:"Independence was the optimistic floor. Turn <b>correlation</b> up: 15% of results hit a shared dependency that stalls the whole fan-out at once. The tail fattens past the clean <code>1−(1−w)^N</code>—a contested cache or lock hurts every call in the result together.",
    s:{mode:"parallel",n:18,w:0.01,slowMean:800,budget:250,rho:0.15}},
-  {name:"⑦ Sandbox",
-   story:"Every value is a knob now. Drop reliability toward <b>p90</b>, add a few calls, make the tail heavier, turn on some correlation. Put your own system's numbers in and read the bad rate off.",
-   s:{mode:"parallel",n:8,w:0.01,slowMean:800,budget:250,rho:0}},
+  {name:"⑦ Hedge it",
+   story:"Now fight back. Same 18-call fan-out, but <b>hedge</b> is on: each slow call gets a backup to a second replica, so a call is slow only if <i>both</i> tries are—<code>w</code> drops to <code>w²</code> and <b>one in six</b> becomes almost none. Then turn <b>correlation</b> up and watch the fix evaporate: a shared stall hits both replicas at once.",
+   s:{mode:"parallel",n:18,w:0.01,slowMean:800,budget:250,rho:0,hedge:true}},
+  {name:"⑧ Sandbox",
+   story:"Every value is a knob now. Drop reliability toward <b>p90</b>, add a few calls, make the tail heavier, turn on some correlation, hedge the slow calls. Put your own system's numbers in and read the bad rate off.",
+   s:{mode:"parallel",n:8,w:0.01,slowMean:800,budget:250,rho:0,hedge:false}},
 ];
 const pc=document.getElementById("presets");
 PRESETS.forEach((p,i)=>{
