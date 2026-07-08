@@ -1,7 +1,7 @@
 # Tail Scale
 
 *"Our p99 is fine"* and *"one user in six has a bad time"* are the same
-sentence. This is a toy demonstration for understanding why.
+sentence. This is a toy for seeing why.
 
 This isn't a new idea. Marc Brooker laid out the model it runs on in 2021, and
 Dean and Barroso had named the effect eight years before that, in their classic
@@ -10,7 +10,7 @@ sit comfortably inside its percentiles while a real share of its users have a
 slow experience in aggregate. This project builds on their work and lets you
 watch it happen.
 
-When we reason about latency, we often do so with an average in our heads, or that only one in a hundred calls are slow, and those can hide what's happening in the tail. What catches us out isn't arithmetic as much as tail latency is **distributional**. When mobile home screen or web page fires multiple calls to render itself, the share of slow results experienced by users climbs far faster than a single endpoint's dashboard might ever suggest.
+We usually reason about latency with an average in our heads—or a line like "only one call in a hundred is slow." Both hide the tail. What catches us out isn't the arithmetic; it's that tail latency is **distributional**. When a mobile home screen or web page fires a dozen calls to render itself, the share of slow results a user actually sees climbs far faster than any single endpoint's dashboard would suggest.
 
 ## Run it
 
@@ -23,7 +23,7 @@ If you prefer code, the numbers the web page is built on are taken from the code
 uv run model.py
 ```
 
-This prints an N-vs-P(bad) table, asserts the parallel result matches the analytic formula (and that hedging collapses the per-call miss to `w²`), and regenerates the plots below. And so `index.html` and `model.py` run the identical model, and `model.py` asserts the Monte-Carlo agrees with `1 − (1 − w)^N`.
+This prints an N-vs-P(bad) table, asserts the parallel Monte-Carlo matches the analytic `1 − (1 − w)^N` (and that hedging collapses the per-call miss to `w²`), and regenerates the plots below. The page and the script run the identical model.
 
 ### The controls
 
@@ -49,11 +49,11 @@ P(good) = (1 − w)^N
 P(bad) = 1 − (1 − w)^N
 ```
 
-An 18-call fan-out at p99 would be `1 − 0.99¹⁸ ≈ 17%`. That means one result in six is bad, and nothing about the backend changed: it's still performing at 99 good calls in a 100. But when we add calls from the client we add more exposure and it's surprising how things mount up. The canonical case is harsher still [1]—a request touching 100 backends at p99 leaves only `0.99¹⁰⁰ ≈ 37%` of responses good. A mobile or web home screen is a milder, but everyday instance of the same issue.
+An 18-call fan-out at p99 would be `1 − 0.99¹⁸ ≈ 17%`. That means one result in six is bad, and nothing about the backend changed: it's still performing at 99 good calls in a 100. But every call the client adds is more exposure, and it mounts up quickly. The canonical case is harsher still [1]—a request touching 100 backends at p99 leaves only `0.99¹⁰⁰ ≈ 37%` of responses good. A mobile or web home screen is a milder but everyday version of the same thing.
 
 And one in six counts results, not people. A user opens the app many times a day, so more than one in six will hit at least one slow screen—the per-user reality is worse than the per-result number, not better.
 
-And p99 is maybe a generous case. Per-call reliability on mobile lives nearer
+Even p99 is generous. Per-call reliability on mobile lives nearer
 p90–p95 [3]: cellular radios wake slowly, connections start cold, people move in and out of good cell coverage. A fan-out of eight isn't remarkable: a typical request
 fans out to about six backends, and an Amazon web page build touches 100–150 [2].
 At p95 across eight calls the bad rate is already one result in three, but no
@@ -63,7 +63,7 @@ single endpoint will look unhealthy from monitoring.
 
 ## Parallel and serial fail by different mechanisms
 
-This is the part the code and the web page aims to make visible, and a part that's easy to get wrong (I got it wrong in my first write-up for this idea):
+This is the part the code and the page aim to make visible—and the part that's easy to get wrong (I got it wrong in my first write-up):
 
 - **Parallel** (fan-out, wait on the slowest) is a `max()`. One unlucky call
   drags the whole result, so the tail **fattens**: a once 1% event becomes
@@ -71,7 +71,7 @@ This is the part the code and the web page aims to make visible, and a part that
 
 - **Serial** (a dependent chain) is a `sum()`. The tail gets averaged away [4].
   What blows the budget instead is the mean accumulating. Making 15 calls at
-  80ms takes 1.2s, past a 250ms budget on the average alone, no slow calls are really required for that to stack up quickly.
+  80ms takes 1.2s—past a 250ms budget on the average alone, no slow call required.
 
 A fan-out punishes the experience with variance; a chain punishes it with the mean. Parallel grows a second hump out at the tail, serial shoves the entire distribution past the budget:
 
@@ -97,13 +97,13 @@ in, so the bad rates here read as an underestimate.
 The bimodal experiment—parallel as `max`, serial as `sum`—follows Marc
 Brooker [5].
 
-This is just a quick model to build intuition, and there are two caveats worth mentioning:
+It's a quick model for intuition, with two caveats:
 
 - Independence is often the optimistic case. `(1 − w)^N` assumes
-  calls are uncorrelated. A shared backend, a common GC pause, a queue in a proxy,  or a saturated link means stalls become correlated. Now that can actually be sometimes better (if one stall covers many calls), but quite often it's going to be worse (one contested node on the path affects every fan-out).
+  calls are uncorrelated. A shared backend, a common GC pause, a proxy queue, a saturated link—any of them correlates the stalls. That can sometimes help (one stall covers many calls at once), but more often it hurts (one contested node on the path drags every call in the fan-out).
 
 - It's a teaching model, not a capacity planner. Real latency is multi-modal
-  and rarely a sum of Gaussians. But if the concept lands, it should help you focus on the 'true' user experience as well as percentiles, where every service can work inside its SLO, while a good proportion of users have a slow experience.
+  and rarely a sum of Gaussians. But if the concept lands, it should help you watch the actual user experience alongside the percentiles—every service inside its SLO, and a real share of users still slow.
 
 
 ## What helps, and when it backfires
@@ -114,7 +114,7 @@ The tool mostly shows the problem, but it lets you try one fix—the **hedge** t
 
 **Power of two random choices** [6]. When you get to pick where a request goes, sample two candidates and send it to the less loaded one. It stops a hot spot forming rather than reacting to one—but you need two *real* choices to pick between.
 
-The pattern underneath: you can engineer around an *independent* tail (retry it, hedge it), but you have to *design* around a correlated one (remove the shared dependency, spread the load). Turn the correlation slider up and watch the independent-case math stop protecting you—that's the regime where the cheap fixes quietly stop working.
+An *independent* tail you can fix at runtime—retry it, hedge it. A *correlated* one you have to fix in the design: take the shared dependency out of the path, or spread the load. Hedging looked cheap because independence was doing the work.
 
 ## Notes and references
 
